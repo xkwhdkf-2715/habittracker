@@ -1,17 +1,15 @@
 # app.py
-import os
 import json
 from datetime import datetime, timedelta
 
-import streamlit as st
 import pandas as pd
 import requests
+import streamlit as st
 
 # -----------------------------
 # Page Config
 # -----------------------------
 st.set_page_config(page_title="AI 습관 트래커", page_icon="📊", layout="wide")
-
 st.title("📊 AI 습관 트래커")
 st.caption("오늘의 습관 체크인 → 달성률/차트 → 날씨/강아지 + AI 코치 리포트까지 한 번에!")
 
@@ -23,10 +21,10 @@ with st.sidebar:
     openai_api_key = st.text_input("OpenAI API Key", type="password", help="예: sk-... (필수: AI 리포트 생성)")
     owm_api_key = st.text_input("OpenWeatherMap API Key", type="password", help="필수: 날씨 불러오기")
     st.divider()
-    st.markdown("**Tip**: 키는 세션에만 사용되며 저장되지 않아요.")
+    st.caption("Tip: 키는 세션에만 사용되며 저장되지 않아요.")
 
 # -----------------------------
-# Session State Init
+# Constants
 # -----------------------------
 HABITS = [
     ("기상 미션", "⏰"),
@@ -36,9 +34,18 @@ HABITS = [
     ("수면", "😴"),
 ]
 
-CITIES = [
-    "Seoul", "Busan", "Incheon", "Daegu", "Daejeon",
-    "Gwangju", "Ulsan", "Suwon", "Changwon", "Jeju"
+# ✅ OpenWeatherMap 404/모호성 방지: "도시,KR"로 고정 (Jeju는 Jeju City 권장)
+CITY_OPTIONS = [
+    ("Seoul", "Seoul,KR"),
+    ("Busan", "Busan,KR"),
+    ("Incheon", "Incheon,KR"),
+    ("Daegu", "Daegu,KR"),
+    ("Daejeon", "Daejeon,KR"),
+    ("Gwangju", "Gwangju,KR"),
+    ("Ulsan", "Ulsan,KR"),
+    ("Suwon", "Suwon,KR"),
+    ("Changwon", "Changwon,KR"),
+    ("Jeju", "Jeju City,KR"),
 ]
 
 COACH_STYLES = {
@@ -47,28 +54,30 @@ COACH_STYLES = {
     "게임 마스터": "RPG 퀘스트/레벨업 톤으로 재미있게 이끄는 게임 마스터",
 }
 
+# -----------------------------
+# Session State Init
+# -----------------------------
 def _init_demo_history():
     """6일 샘플 데이터(데모) 생성"""
     today = datetime.now().date()
     base = []
-    # 6 days back
     for i in range(6, 0, -1):
         d = today - timedelta(days=i)
-        # 데모용으로 약간의 변동을 줌
-        achieved = max(0, min(5, (i % 6)))  # 1~5 비슷하게
-        mood = max(1, min(10, 6 + (3 - (i % 7)) ))  # 1~10
-        base.append({
-            "date": d.isoformat(),
-            "achieved": achieved,
-            "rate": round(achieved / 5 * 100, 1),
-            "mood": mood
-        })
+        achieved = max(0, min(5, 1 + (i % 5)))
+        mood = max(1, min(10, 6 + (2 - (i % 5))))
+        base.append(
+            {
+                "date": d.isoformat(),
+                "achieved": achieved,
+                "rate": round(achieved / 5 * 100, 1),
+                "mood": mood,
+            }
+        )
     return base
 
+
 if "history" not in st.session_state:
-    st.session_state["history"] = _init_demo_history()  # 6일
-if "today_saved" not in st.session_state:
-    st.session_state["today_saved"] = False
+    st.session_state["history"] = _init_demo_history()
 if "latest_report" not in st.session_state:
     st.session_state["latest_report"] = None
 if "latest_share_text" not in st.session_state:
@@ -77,64 +86,67 @@ if "latest_share_text" not in st.session_state:
 # -----------------------------
 # API Helpers
 # -----------------------------
-def get_weather(city: str, api_key: str):
+def get_weather(city_query: str, api_key: str):
     """
     OpenWeatherMap에서 날씨 가져오기 (한국어, 섭씨)
-    실패 시 None 반환, timeout=10
+    ✅ 실패 시 (None, 에러메시지) 반환
+    - timeout=10
+    - city_query 예: "Seoul,KR"
     """
-    if not city or not api_key:
-        return None
+    if not city_query or not api_key:
+        return None, "Missing city or API key"
+
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {
-        "q": city,
-        "appid": api_key,
+        "q": city_query,
+        "appid": api_key.strip(),
         "units": "metric",
-        "lang": "kr"
+        "lang": "kr",
     }
     try:
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
-            return None
+            # OWM은 보통 {"message":"..."} 형태로 이유 제공
+            try:
+                msg = r.json().get("message", "")
+            except Exception:
+                msg = (r.text or "")[:200]
+            return None, f"HTTP {r.status_code}: {msg}"
+
         data = r.json()
         weather_desc = (data.get("weather") or [{}])[0].get("description")
-        temp = data.get("main", {}).get("temp")
-        feels = data.get("main", {}).get("feels_like")
-        humidity = data.get("main", {}).get("humidity")
-        wind = data.get("wind", {}).get("speed")
-        return {
-            "city": city,
-            "description": weather_desc,
-            "temp_c": temp,
-            "feels_like_c": feels,
-            "humidity": humidity,
-            "wind_ms": wind,
-        }
-    except Exception:
-        return None
+        main = data.get("main", {}) or {}
+        wind = data.get("wind", {}) or {}
+        return (
+            {
+                "city": city_query,
+                "description": weather_desc,
+                "temp_c": main.get("temp"),
+                "feels_like_c": main.get("feels_like"),
+                "humidity": main.get("humidity"),
+                "wind_ms": wind.get("speed"),
+            },
+            None,
+        )
+    except Exception as e:
+        return None, f"Exception: {e}"
+
 
 def _extract_breed_from_url(image_url: str):
-    """
-    Dog CEO 이미지 URL에서 품종 추정
-    예) https://images.dog.ceo/breeds/hound-afghan/n02088094_1003.jpg -> hound / afghan
-    """
+    """Dog CEO 이미지 URL에서 품종 추정"""
     try:
         parts = image_url.split("/breeds/")[1].split("/")
-        breed_part = parts[0]  # e.g., hound-afghan
-        breed_part = breed_part.replace("-", " ")
-        # 서브브리드 있으면 보기 좋게
+        breed_part = parts[0].replace("-", " ")
         words = breed_part.split()
         if len(words) >= 2:
-            # "hound afghan" -> "Afghan Hound"
             return f"{words[1].title()} {words[0].title()}"
         return breed_part.title()
     except Exception:
         return "Unknown"
 
+
 def get_dog_image():
-    """
-    Dog CEO에서 랜덤 강아지 사진 URL과 품종 가져오기
-    실패 시 None 반환, timeout=10
-    """
+    """Dog CEO에서 랜덤 강아지 사진 URL과 품종 가져오기 (실패 시 None), timeout=10"""
     url = "https://dog.ceo/api/breeds/image/random"
     try:
         r = requests.get(url, timeout=10)
@@ -151,6 +163,7 @@ def get_dog_image():
     except Exception:
         return None
 
+
 def _system_prompt_for_style(style: str) -> str:
     if style == "스파르타 코치":
         return (
@@ -164,12 +177,12 @@ def _system_prompt_for_style(style: str) -> str:
             "사용자는 플레이어이며, 습관은 퀘스트/스탯/레벨업으로 표현한다. "
             "재미있고 몰입감 있게, 하지만 실제로 실행 가능한 조언을 제공해라."
         )
-    # default: 따뜻한 멘토
     return (
         "너는 따뜻하고 공감하는 멘토다. "
         "사용자의 노력과 감정을 인정하고, 작은 성취도 칭찬한다. "
         "부담 없는 다음 행동을 제안해라."
     )
+
 
 def generate_report(
     openai_key: str,
@@ -179,12 +192,7 @@ def generate_report(
     weather: dict | None,
     dog: dict | None,
 ):
-    """
-    습관+기분+날씨+강아지 품종을 모아서 OpenAI에 전달
-    - 모델: gpt-5-mini
-    - 출력 형식:
-      컨디션 등급(S~D), 습관 분석, 날씨 코멘트, 내일 미션, 오늘의 한마디
-    """
+    """습관+기분+날씨+강아지 품종을 모아서 OpenAI에 전달 (모델: gpt-5-mini)"""
     if not openai_key:
         return None, "OpenAI API Key가 필요해요."
 
@@ -233,10 +241,10 @@ def generate_report(
 오늘의 한마디: (한 문장)
 """.strip()
 
-    # --- OpenAI call (SDK v1 style preferred) ---
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
+
+        client = OpenAI(api_key=openai_key.strip())
 
         # Responses API 우선
         try:
@@ -249,7 +257,6 @@ def generate_report(
             )
             text = getattr(resp, "output_text", None)
             if not text:
-                # 혹시 구조가 다르면 안전 처리
                 text = str(resp)
             return text, None
         except Exception:
@@ -261,8 +268,7 @@ def generate_report(
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            text = chat.choices[0].message.content
-            return text, None
+            return chat.choices[0].message.content, None
 
     except Exception as e:
         return None, f"OpenAI 호출 실패: {e}"
@@ -273,12 +279,12 @@ def generate_report(
 st.subheader("✅ 오늘의 습관 체크인")
 
 colA, colB = st.columns([1.2, 1])
+
 with colA:
     st.markdown("**습관 체크** (5개, 2열)")
     c1, c2 = st.columns(2)
     checked = {}
 
-    # 5개를 2열에 배치
     for idx, (name, emoji) in enumerate(HABITS):
         target_col = c1 if idx % 2 == 0 else c2
         with target_col:
@@ -288,7 +294,8 @@ with colA:
 
 with colB:
     st.markdown("**환경 설정**")
-    city = st.selectbox("🏙️ 도시 선택", CITIES, index=0)
+    city_label = st.selectbox("🏙️ 도시 선택", [c[0] for c in CITY_OPTIONS], index=0)
+    city_query = dict(CITY_OPTIONS)[city_label]
     coach_style = st.radio("🎭 코치 스타일", list(COACH_STYLES.keys()), index=1)
     st.caption(f"설명: {COACH_STYLES[coach_style]}")
 
@@ -308,57 +315,35 @@ m3.metric("기분", f"{mood}/10")
 # -----------------------------
 st.subheader("📈 최근 7일 달성률")
 
-# 오늘 기록(미저장 상태라도 차트에 포함)
 today = datetime.now().date().isoformat()
-chart_rows = list(st.session_state["history"])  # 6일 데모(+저장된 과거)
-# history가 이미 7일 이상일 수 있으니 최근 6일만 유지하고, 오늘은 별도로 붙임
-# (저장 로직에서는 오늘을 history에 넣고, 여기서는 중복 방지)
-chart_rows = [r for r in chart_rows if r.get("date") != today]
-chart_rows = chart_rows[-6:]
 
-chart_rows.append({
-    "date": today,
-    "achieved": achieved_cnt,
-    "rate": round(rate_pct, 1),
-    "mood": mood,
-})
+chart_rows = [r for r in st.session_state["history"] if r.get("date") != today]
+chart_rows = chart_rows[-6:]
+chart_rows.append({"date": today, "achieved": achieved_cnt, "rate": float(rate_pct), "mood": mood})
 
 df = pd.DataFrame(chart_rows)
 df["date"] = pd.to_datetime(df["date"])
 df = df.sort_values("date")
-
-# 바 차트: 달성률
-chart_df = df.set_index("date")[["rate"]]
-st.bar_chart(chart_df)
+st.bar_chart(df.set_index("date")[["rate"]])
 
 # -----------------------------
 # Generate Report
 # -----------------------------
 st.subheader("🧠 AI 코치 리포트")
-
 btn = st.button("컨디션 리포트 생성", type="primary")
 
 if btn:
-    # Save today's record into history (session_state)
-    # 같은 날짜면 업데이트
-    new_row = {
-        "date": today,
-        "achieved": achieved_cnt,
-        "rate": round(rate_pct, 1),
-        "mood": mood,
-    }
+    # Save today's record
+    new_row = {"date": today, "achieved": achieved_cnt, "rate": float(rate_pct), "mood": mood}
     hist = [r for r in st.session_state["history"] if r.get("date") != today]
     hist.append(new_row)
-    # 최신 14일 정도만 유지(너무 커지는 것 방지)
     hist = sorted(hist, key=lambda x: x["date"])[-14:]
     st.session_state["history"] = hist
-    st.session_state["today_saved"] = True
 
-    # Fetch APIs
-    weather = get_weather(city, owm_api_key)
+    # Fetch APIs (✅ 날씨는 (data, err) 형태로 받음)
+    weather, weather_err = get_weather(city_query, owm_api_key)
     dog = get_dog_image()
 
-    # Generate AI report
     with st.spinner("AI 코치가 리포트를 작성 중..."):
         report, err = generate_report(
             openai_key=openai_api_key,
@@ -374,21 +359,22 @@ if btn:
     else:
         st.success("리포트 생성 완료!")
 
-    # Render cards (weather + dog)
     left, right = st.columns(2)
 
     with left:
         st.markdown("### 🌦️ 오늘의 날씨")
         if weather:
             st.info(
-                f"**{weather.get('city')}**\n\n"
+                f"**{city_label}**  (`{weather.get('city')}`)\n\n"
                 f"- 상태: {weather.get('description')}\n"
                 f"- 기온: {weather.get('temp_c')}°C (체감 {weather.get('feels_like_c')}°C)\n"
                 f"- 습도: {weather.get('humidity')}%\n"
                 f"- 바람: {weather.get('wind_ms')} m/s"
             )
         else:
-            st.warning("날씨 정보를 불러오지 못했어요. (도시/키 확인)")
+            st.warning("날씨 정보를 불러오지 못했어요.")
+            if weather_err:
+                st.caption(f"원인: {weather_err}")
 
     with right:
         st.markdown("### 🐶 오늘의 강아지 카드")
@@ -397,27 +383,27 @@ if btn:
         else:
             st.warning("강아지 이미지를 불러오지 못했어요.")
 
-    # Report display
     st.markdown("### 🧾 AI 코치 리포트")
     if report:
         st.write(report)
 
-    # Share text
     share_payload = {
         "date": today,
-        "city": city,
+        "city": city_label,
+        "city_query": city_query,
         "coach_style": coach_style,
         "rate_percent": rate_pct,
         "achieved": f"{achieved_cnt}/5",
         "mood": mood,
         "weather": weather,
+        "weather_error": weather_err,
         "dog": dog,
         "report": report,
     }
     share_text = (
         f"[AI 습관 트래커 공유]\n"
         f"- 날짜: {today}\n"
-        f"- 도시: {city}\n"
+        f"- 도시: {city_label} ({city_query})\n"
         f"- 코치: {coach_style}\n"
         f"- 달성률: {rate_pct}% ({achieved_cnt}/5)\n"
         f"- 기분: {mood}/10\n\n"
@@ -427,7 +413,6 @@ if btn:
     st.session_state["latest_report"] = report
     st.session_state["latest_share_text"] = share_text
 
-# If already generated earlier, show share text
 if st.session_state.get("latest_share_text"):
     st.markdown("### 🔗 공유용 텍스트")
     st.code(st.session_state["latest_share_text"], language="text")
@@ -444,13 +429,13 @@ with st.expander("📌 API 안내 / 준비물"):
 
 **2) OpenWeatherMap API Key**
 - 날씨 카드에 필요해요.
-- OpenWeatherMap에서 발급받은 API Key를 넣어주세요.
 - 호출 옵션: `units=metric`(섭씨), `lang=kr`(한국어)
+- ✅ 도시를 `Seoul,KR`처럼 국가코드를 붙여 요청합니다(404/모호성 방지).
 
 **3) Dog CEO (무료, 키 불필요)**
 - 랜덤 강아지 이미지를 가져옵니다.
 
 **오류가 날 때**
-- 키가 비었거나 잘못된 경우, 네트워크가 느린 경우(타임아웃 10초), 도시명이 인식되지 않는 경우일 수 있어요.
+- 날씨가 안 나오면 “원인: HTTP 401/404/429 …” 메시지를 확인해 주세요.
 """
     )
